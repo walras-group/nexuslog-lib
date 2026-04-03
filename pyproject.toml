@@ -28,6 +28,15 @@ Homepage = "https://github.com/river-walras/nexuslogger"
 Repository = "https://github.com/river-walras/nexuslogger"
 Issues = "https://github.com/river-walras/nexuslogger/issues"
 
+[dependency-groups]
+benchmark = [
+    "loguru>=0.7.3",
+    "logxide",
+    "matplotlib>=3.10.8",
+    "picologging>=0.9.3",
+    "spdlog>=2.0.6",
+]
+
 [tool.maturin]
 features = ["python"]
 python-source = "python"

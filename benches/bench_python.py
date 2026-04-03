@@ -4,6 +4,8 @@ import logging
 import time
 import tempfile
 import os
+import subprocess
+import sys
 
 # Number of log messages per benchmark
 N_MESSAGES = 1_000_000
@@ -49,6 +51,35 @@ def bench_loguru(log_file: str) -> float:
     elapsed = time.perf_counter() - start
 
     logger.remove(sink_id)
+    return elapsed
+
+
+def bench_logxide(log_file: str) -> float:
+    """Benchmark logxide."""
+    # The Python 3.11 build auto-installs a root stream handler and ignores
+    # file-based configuration, so run it in isolation and capture its output.
+    code = f"""
+import logxide
+
+N_MESSAGES = {N_MESSAGES}
+logger = logxide.getLogger("logxide_bench")
+logger.setLevel(logxide.INFO)
+
+for i in range(N_MESSAGES):
+    logger.info("Benchmark message number %d", i)
+
+logxide.flush()
+"""
+    start = time.perf_counter()
+    with open(log_file, "w") as output:
+        subprocess.run(
+            [sys.executable, "-c", code],
+            check=True,
+            stdout=output,
+            stderr=subprocess.DEVNULL,
+        )
+    elapsed = time.perf_counter() - start
+
     return elapsed
 
 
@@ -209,6 +240,11 @@ def main():
         loguru_time = bench_loguru(loguru_log)
         loguru_size = os.path.getsize(loguru_log)
 
+        # Benchmark logxide
+        logxide_log = os.path.join(tmpdir, "logxide.log")
+        logxide_time = bench_logxide(logxide_log)
+        logxide_size = os.path.getsize(logxide_log)
+
         # Benchmark picologging
         pico_log = os.path.join(tmpdir, "pico.log")
         pico_time = bench_picologging(pico_log)
@@ -259,6 +295,13 @@ def main():
                     "color": "#FFB20F",
                 },
                 {
+                    "name": "logxide",
+                    "time": logxide_time,
+                    "msgs_per_sec": N_MESSAGES / logxide_time,
+                    "size": logxide_size,
+                    "color": "#3A86FF",
+                },
+                {
                     "name": "picologging",
                     "time": pico_time,
                     "msgs_per_sec": N_MESSAGES / pico_time,
@@ -295,6 +338,7 @@ def main():
         print("-" * 60)
         print(f"\nNexusLogger is {py_time / rust_time:.2f}x faster than Python logging")
         print(f"NexusLogger is {loguru_time / rust_time:.2f}x faster than loguru")
+        print(f"NexusLogger is {logxide_time / rust_time:.2f}x faster than logxide")
         print(f"NexusLogger is {pico_time / rust_time:.2f}x faster than picologging")
         print(f"NexusLogger is {spdlog_time / rust_time:.2f}x faster than spdlog")
         print(
@@ -302,6 +346,9 @@ def main():
         )
         print(
             f"NexusLogger unix_ts is {loguru_time / rust_unix_time:.2f}x faster than loguru"
+        )
+        print(
+            f"NexusLogger unix_ts is {logxide_time / rust_unix_time:.2f}x faster than logxide"
         )
         print(
             f"NexusLogger unix_ts is {pico_time / rust_unix_time:.2f}x faster than picologging"
