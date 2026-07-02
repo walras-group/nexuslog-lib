@@ -11,7 +11,7 @@ permissions:
   contents: read
 
 env:
-  PYTHON_VERSIONS: "3.11 3.12 3.13"
+  PYTHON_VERSIONS: "3.11 3.12 3.13 3.14"
 
 jobs:
   # Build wheels for Linux
@@ -28,11 +28,12 @@ jobs:
             3.11
             3.12
             3.13
+            3.14
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist -i python3.11 -i python3.12 -i python3.13
+          args: --release --out dist -i python3.11 -i python3.12 -i python3.13 -i python3.14
           sccache: 'true'
           manylinux: auto
       - name: Upload wheels
@@ -55,10 +56,11 @@ jobs:
             3.11
             3.12
             3.13
+            3.14
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
-          args: --release --out dist -i python3.11 -i python3.12 -i python3.13
+          args: --release --out dist -i python3.11 -i python3.12 -i python3.13 -i python3.14
           sccache: 'true'
       - name: Upload wheels
         uses: actions/upload-artifact@v4
@@ -80,11 +82,12 @@ jobs:
             3.11
             3.12
             3.13
+            3.14
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}-apple-darwin
-          args: --release --out dist -i python3.11 -i python3.12 -i python3.13
+          args: --release --out dist -i python3.11 -i python3.12 -i python3.13 -i python3.14
           sccache: 'true'
       - name: Upload wheels
         uses: actions/upload-artifact@v4
