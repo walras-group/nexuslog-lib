@@ -24,9 +24,11 @@ def bench_picologging(log_file: str) -> float:
     )
     pico_logger.addHandler(handler)
 
+    messages = [f"Benchmark message number {i}" for i in range(N_MESSAGES)]
+
     start = time.perf_counter()
-    for i in range(N_MESSAGES):
-        pico_logger.info("Benchmark message number %d", i)
+    for msg in messages:
+        pico_logger.info(msg)
     handler.flush()
     elapsed = time.perf_counter() - start
 
@@ -45,9 +47,11 @@ def bench_loguru(log_file: str) -> float:
         level="INFO",
     )
 
+    messages = [f"Benchmark message number {i}" for i in range(N_MESSAGES)]
+
     start = time.perf_counter()
-    for i in range(N_MESSAGES):
-        logger.info("Benchmark message number {}", i)
+    for msg in messages:
+        logger.info(msg)
     elapsed = time.perf_counter() - start
 
     logger.remove(sink_id)
@@ -65,8 +69,10 @@ N_MESSAGES = {N_MESSAGES}
 logger = logxide.getLogger("logxide_bench")
 logger.setLevel(logxide.INFO)
 
-for i in range(N_MESSAGES):
-    logger.info("Benchmark message number %d", i)
+messages = [f"Benchmark message number {{i}}" for i in range(N_MESSAGES)]
+
+for msg in messages:
+    logger.info(msg)
 
 logxide.flush()
 """
@@ -92,9 +98,11 @@ def bench_spdlog(log_file: str) -> float:
     else:
         raise RuntimeError("spdlog.FileLogger is not available in this spdlog build")
 
+    messages = [f"Benchmark message number {i}" for i in range(N_MESSAGES)]
+
     start = time.perf_counter()
-    for i in range(N_MESSAGES):
-        spd_logger.info(f"Benchmark message number {i}")
+    for msg in messages:
+        spd_logger.info(msg)
     if hasattr(spd_logger, "flush"):
         spd_logger.flush()
     elapsed = time.perf_counter() - start
@@ -197,9 +205,11 @@ def bench_python_logging(log_file: str) -> float:
     )
     py_logger.addHandler(handler)
 
+    messages = [f"Benchmark message number {i}" for i in range(N_MESSAGES)]
+
     start = time.perf_counter()
-    for i in range(N_MESSAGES):
-        py_logger.info("Benchmark message number %d", i)
+    for msg in messages:
+        py_logger.info(msg)
     handler.flush()
     elapsed = time.perf_counter() - start
 
@@ -209,15 +219,23 @@ def bench_python_logging(log_file: str) -> float:
 
 
 def bench_rust_logger(log_file: str, unix_ts: bool) -> float:
-    """Benchmark NexusLogger."""
+    """Benchmark NexusLogger.
+
+    Messages are pre-formatted outside the timed region so the benchmark
+    measures the logger's own throughput rather than Python-side f-string
+    formatting (a fixed ~200ns/msg cost that dilutes library speedups). This
+    mirrors benches/micro.py and lets version-over-version gains show through.
+    """
     import nexuslog as logging
 
     logging.basicConfig(log_file, level=logging.Level.Info, unix_ts=unix_ts)
     log = logging.getLogger("bench")
 
+    messages = [f"Benchmark message number {i}" for i in range(N_MESSAGES)]
+
     start = time.perf_counter()
-    for i in range(N_MESSAGES):
-        log.info(f"Benchmark message number {i}")
+    for msg in messages:
+        log.info(msg)
     log.shutdown()  # Ensures all messages are flushed
     elapsed = time.perf_counter() - start
 
