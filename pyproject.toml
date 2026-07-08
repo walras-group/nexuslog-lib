@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "nexuslog-lib"
-version = "0.6.0"
+version = "0.7.0"
 description = "Fast async logger with Python bindings"
 readme = "README.md"
 license = "MIT"

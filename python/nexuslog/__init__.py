@@ -92,29 +92,44 @@ def _get_root_logger() -> Logger:
     return _root_logger
 
 
-def trace(message: str) -> None:
-    """Log a trace message to the root logger."""
-    _get_root_logger().trace(message)
+def trace(message: str, *args: object) -> None:
+    """Log a trace message to the root logger.
+
+    Extra args are merged into message lazily using %-style formatting.
+    """
+    _get_root_logger().trace(message, *args)
 
 
-def debug(message: str) -> None:
-    """Log a debug message to the root logger."""
-    _get_root_logger().debug(message)
+def debug(message: str, *args: object) -> None:
+    """Log a debug message to the root logger.
+
+    Extra args are merged into message lazily using %-style formatting.
+    """
+    _get_root_logger().debug(message, *args)
 
 
-def info(message: str) -> None:
-    """Log an info message to the root logger."""
-    _get_root_logger().info(message)
+def info(message: str, *args: object) -> None:
+    """Log an info message to the root logger.
+
+    Extra args are merged into message lazily using %-style formatting.
+    """
+    _get_root_logger().info(message, *args)
 
 
-def warning(message: str) -> None:
-    """Log a warning message to the root logger."""
-    _get_root_logger().warning(message)
+def warning(message: str, *args: object) -> None:
+    """Log a warning message to the root logger.
+
+    Extra args are merged into message lazily using %-style formatting.
+    """
+    _get_root_logger().warning(message, *args)
 
 
-def error(message: str) -> None:
-    """Log an error message to the root logger."""
-    _get_root_logger().error(message)
+def error(message: str, *args: object) -> None:
+    """Log an error message to the root logger.
+
+    Extra args are merged into message lazily using %-style formatting.
+    """
+    _get_root_logger().error(message, *args)
 
 
 def shutdown() -> None:

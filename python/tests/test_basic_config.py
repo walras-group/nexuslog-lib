@@ -1,9 +1,16 @@
+import pathlib
+
 import nexuslog as logging
 
 
 def _read_file(path: str) -> str:
-    with open(path, "r", encoding="utf-8", errors="ignore") as f:
-        return f.read()
+    # The writer appends a _YYYYMMDD suffix to the configured filename, so
+    # read every log file next to the configured path.
+    parent = pathlib.Path(path).parent
+    return "".join(
+        p.read_text(encoding="utf-8", errors="ignore")
+        for p in sorted(parent.glob("*.log"))
+    )
 
 
 def test_name_levels_override_default(tmp_path) -> None:

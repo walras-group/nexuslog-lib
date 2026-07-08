@@ -29,6 +29,10 @@ struct Producer {
     fmt: TimestampCache,
     buf: Vec<u8>,
     count: usize,
+    // Scratch for the Python bindings' %-formatting; lives here so the hot
+    // path touches a single, already-cached thread-local slot.
+    #[cfg(feature = "python")]
+    scratch: Vec<u8>,
 }
 
 impl Producer {
@@ -38,6 +42,8 @@ impl Producer {
             fmt: TimestampCache::new(),
             buf: Vec::with_capacity(BATCH_BUF_CAP),
             count: 0,
+            #[cfg(feature = "python")]
+            scratch: Vec::new(),
         }
     }
 }
@@ -155,6 +161,8 @@ impl ThreadTimestampCache {
 enum Action {
     WriteBytes(Vec<u8>),
     Flush,
+    // Flush, then signal the sender so it can rely on the data being on disk.
+    FlushSync(Sender<()>),
     Exit,
 }
 
@@ -439,6 +447,10 @@ fn worker<P: ToString + Send>(mut ctx: Context<P>) -> Result<(), std::io::Error>
             Ok(Action::Flush) => {
                 target.flush()?;
             }
+            Ok(Action::FlushSync(ack)) => {
+                target.flush()?;
+                let _ = ack.send(());
+            }
             Ok(Action::Exit) => {
                 target.flush()?;
                 break;
@@ -499,13 +511,15 @@ pub fn init<P: ToString + Send + 'static>(name: &str, path: Option<P>, level: Le
 mod python {
     use super::{
         emit, flush_producer, worker, Action, Context, LevelFilter, CHANNEL_CAPACITY,
-        DEFAULT_BATCH_SIZE,
+        DEFAULT_BATCH_SIZE, PRODUCER,
     };
     use chrono::Local;
     use crossbeam_channel::Sender;
     use pyo3::prelude::*;
+    use pyo3::types::{PyDict, PyFloat, PyInt, PyString, PyTuple};
     use std::collections::HashMap;
     use std::hash::{Hash, Hasher};
+    use std::io::Write;
     use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, OnceLock, Weak};
     use std::thread::JoinHandle;
@@ -650,6 +664,202 @@ mod python {
         }
     }
 
+    fn push_u64(buf: &mut Vec<u8>, mut v: u64, base: u64) {
+        let mut digits = [0u8; 22]; // u64 needs at most 22 octal digits
+        let mut i = digits.len();
+        loop {
+            let d = (v % base) as u8;
+            i -= 1;
+            digits[i] = if d < 10 { b'0' + d } else { b'a' + d - 10 };
+            v /= base;
+            if v == 0 {
+                break;
+            }
+        }
+        buf.extend_from_slice(&digits[i..]);
+    }
+
+    fn push_i64(buf: &mut Vec<u8>, v: i64) {
+        if v < 0 {
+            buf.push(b'-');
+        }
+        push_u64(buf, v.unsigned_abs(), 10);
+    }
+
+    /// Write Python's repr(float) for the decimal-notation range; returns
+    /// false when Python would use scientific notation (or for nan/inf) so
+    /// the caller can fall back to PyObject_Str. Inside the range, Python's
+    /// repr and Rust's Display both print the shortest round-trip digits, so
+    /// output is identical except for the ".0" Python appends to whole values.
+    fn push_f64_repr(out: &mut Vec<u8>, v: f64) -> bool {
+        if v == 0.0 {
+            out.extend_from_slice(if v.is_sign_negative() { b"-0.0" } else { b"0.0" });
+            return true;
+        }
+        let a = v.abs();
+        // Python repr switches to scientific outside [1e-4, 1e16). NaN and
+        // inf fail this test too.
+        if !(1e-4..1e16).contains(&a) {
+            return false;
+        }
+        let start = out.len();
+        let _ = write!(out, "{}", v);
+        if !out[start..].contains(&b'.') {
+            out.extend_from_slice(b".0");
+        }
+        true
+    }
+
+    /// Delegate the whole message to CPython's `str.__mod__`. Used both for
+    /// format specs outside the fast path and for anomalies (bad counts,
+    /// unknown conversions), so edge semantics and error messages are
+    /// byte-identical to `message % args`.
+    #[cold]
+    fn fallback_format(
+        out: &mut Vec<u8>,
+        message: &Bound<'_, PyString>,
+        target: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        out.clear();
+        let formatted = message.rem(target)?;
+        let formatted = formatted.cast_into::<PyString>()?;
+        out.extend_from_slice(formatted.to_str()?.as_bytes());
+        Ok(())
+    }
+
+    /// Write one converted argument. Ok(false) means the value needs CPython
+    /// `%` semantics the fast path doesn't replicate (float for %d, huge ints,
+    /// non-finite floats, ...) and the caller must fall back.
+    fn convert_one(out: &mut Vec<u8>, conv: u8, obj: &Bound<'_, PyAny>) -> PyResult<bool> {
+        match conv {
+            b's' => {
+                // Exact str skips PyObject_Str (subclasses may override
+                // __str__); exact int within i64 renders natively, since
+                // str(int) is plain decimal digits; exact float renders
+                // natively when its repr uses decimal notation.
+                if let Ok(s) = obj.cast_exact::<PyString>() {
+                    out.extend_from_slice(s.to_str()?.as_bytes());
+                } else if obj.is_exact_instance_of::<PyInt>() {
+                    match obj.extract::<i64>() {
+                        Ok(v) => push_i64(out, v),
+                        Err(_) => out.extend_from_slice(obj.str()?.to_str()?.as_bytes()),
+                    }
+                } else if let Ok(f) = obj.cast_exact::<PyFloat>() {
+                    if !push_f64_repr(out, f.value()) {
+                        out.extend_from_slice(obj.str()?.to_str()?.as_bytes());
+                    }
+                } else {
+                    out.extend_from_slice(obj.str()?.to_str()?.as_bytes());
+                }
+            }
+            b'r' => {
+                // For exact ints and floats, repr == str, so both share the
+                // native paths above.
+                if obj.is_exact_instance_of::<PyInt>() {
+                    if let Ok(v) = obj.extract::<i64>() {
+                        push_i64(out, v);
+                        return Ok(true);
+                    }
+                } else if let Ok(f) = obj.cast_exact::<PyFloat>() {
+                    if push_f64_repr(out, f.value()) {
+                        return Ok(true);
+                    }
+                }
+                out.extend_from_slice(obj.repr()?.to_str()?.as_bytes())
+            }
+            b'd' | b'i' => {
+                // The PyInt gate excludes floats (Python's %d truncates them)
+                // and arbitrary __index__ objects; ints beyond i64 also fall
+                // back. bool is an int subclass and renders as 1/0.
+                if !obj.is_instance_of::<PyInt>() {
+                    return Ok(false);
+                }
+                match obj.extract::<i64>() {
+                    Ok(v) => push_i64(out, v),
+                    Err(_) => return Ok(false),
+                }
+            }
+            b'x' | b'o' => {
+                if !obj.is_instance_of::<PyInt>() {
+                    return Ok(false);
+                }
+                match obj.extract::<i64>() {
+                    Ok(v) => {
+                        // Python renders negatives with a sign, not two's
+                        // complement: "%x" % -255 == "-ff".
+                        if v < 0 {
+                            out.push(b'-');
+                        }
+                        push_u64(out, v.unsigned_abs(), if conv == b'x' { 16 } else { 8 });
+                    }
+                    Err(_) => return Ok(false),
+                }
+            }
+            b'f' => {
+                let Ok(f) = obj.cast::<PyFloat>() else {
+                    return Ok(false); // "%f" % 3 is legal Python
+                };
+                let v = f.value();
+                if !v.is_finite() {
+                    return Ok(false); // Rust prints "NaN", Python "nan"
+                }
+                let _ = write!(out, "{:.6}", v);
+            }
+            _ => unreachable!(),
+        }
+        Ok(true)
+    }
+
+    /// Render `message % args` with stdlib-logging semantics into `out`.
+    /// Bare %s/%r/%d/%i/%x/%o/%f/%% are written directly with no intermediate
+    /// Python string; everything else delegates to CPython's `%` operator.
+    fn render_message(
+        out: &mut Vec<u8>,
+        message: &Bound<'_, PyString>,
+        args: &Bound<'_, PyTuple>,
+    ) -> PyResult<()> {
+        let items = args.as_slice();
+
+        // stdlib quirk (LogRecord.__init__): a single non-empty dict argument
+        // is used as a mapping, enabling %(key)s style.
+        if let [only] = items {
+            if only.is_instance_of::<PyDict>() && only.is_truthy()? {
+                return fallback_format(out, message, only);
+            }
+        }
+
+        let bytes = message.to_str()?.as_bytes();
+        let mut argi = 0usize;
+        let mut i = 0usize;
+        while let Some(off) = bytes[i..].iter().position(|&b| b == b'%') {
+            let pos = i + off;
+            out.extend_from_slice(&bytes[i..pos]);
+            match bytes.get(pos + 1).copied() {
+                Some(b'%') => out.push(b'%'),
+                Some(conv @ (b's' | b'r' | b'd' | b'i' | b'x' | b'o' | b'f')) => {
+                    let Some(obj) = items.get(argi) else {
+                        // too few args -> CPython's exact TypeError
+                        return fallback_format(out, message, args.as_any());
+                    };
+                    if !convert_one(out, conv, obj)? {
+                        return fallback_format(out, message, args.as_any());
+                    }
+                    argi += 1;
+                }
+                // Width/precision/flags, %(name)s, %e/%g, unknown conversions
+                // and a trailing lone '%' all go to CPython.
+                _ => return fallback_format(out, message, args.as_any()),
+            }
+            i = pos + 2;
+        }
+        out.extend_from_slice(&bytes[i..]);
+        if argi != items.len() {
+            // too many args -> CPython's exact TypeError
+            return fallback_format(out, message, args.as_any());
+        }
+        Ok(())
+    }
+
     #[pyclass]
     #[derive(Clone, Copy)]
     pub enum PyLevel {
@@ -705,52 +915,99 @@ mod python {
 
         fn shutdown(&self) {
             flush_producer(&self.writer.tx);
-            let _ = self.writer.tx.send(Action::Flush);
+            // Wait (bounded) for the writer thread to flush, so data is on
+            // disk when shutdown() returns even while other loggers still
+            // share this writer and the thread keeps running.
+            let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
+            if self.writer.tx.send(Action::FlushSync(ack_tx)).is_ok() {
+                let _ = ack_rx.recv_timeout(std::time::Duration::from_secs(5));
+            }
             if Arc::strong_count(&self.writer) == 1 {
                 self.writer.stop();
             }
         }
 
-        fn trace(&self, message: &str) {
-            self.log_internal(log::Level::Trace, message);
+        #[pyo3(signature = (message, *args))]
+        fn trace(&self, message: &Bound<'_, PyString>, args: &Bound<'_, PyTuple>) -> PyResult<()> {
+            self.log_args(log::Level::Trace, message, args)
         }
 
-        fn debug(&self, message: &str) {
-            self.log_internal(log::Level::Debug, message);
+        #[pyo3(signature = (message, *args))]
+        fn debug(&self, message: &Bound<'_, PyString>, args: &Bound<'_, PyTuple>) -> PyResult<()> {
+            self.log_args(log::Level::Debug, message, args)
         }
 
-        fn info(&self, message: &str) {
-            self.log_internal(log::Level::Info, message);
+        #[pyo3(signature = (message, *args))]
+        fn info(&self, message: &Bound<'_, PyString>, args: &Bound<'_, PyTuple>) -> PyResult<()> {
+            self.log_args(log::Level::Info, message, args)
         }
 
-        fn warn(&self, message: &str) {
-            self.log_internal(log::Level::Warn, message);
+        #[pyo3(signature = (message, *args))]
+        fn warn(&self, message: &Bound<'_, PyString>, args: &Bound<'_, PyTuple>) -> PyResult<()> {
+            self.log_args(log::Level::Warn, message, args)
         }
 
         // `warning` mirrors the stdlib `logging` name; `warn` is kept as an alias.
-        fn warning(&self, message: &str) {
-            self.log_internal(log::Level::Warn, message);
+        #[pyo3(signature = (message, *args))]
+        fn warning(&self, message: &Bound<'_, PyString>, args: &Bound<'_, PyTuple>) -> PyResult<()> {
+            self.log_args(log::Level::Warn, message, args)
         }
 
-        fn error(&self, message: &str) {
-            self.log_internal(log::Level::Error, message);
+        #[pyo3(signature = (message, *args))]
+        fn error(&self, message: &Bound<'_, PyString>, args: &Bound<'_, PyTuple>) -> PyResult<()> {
+            self.log_args(log::Level::Error, message, args)
         }
     }
 
     impl PyLogger {
         #[inline]
-        fn log_internal(&self, level: log::Level, message: &str) {
+        fn log_args(
+            &self,
+            level: log::Level,
+            message: &Bound<'_, PyString>,
+            args: &Bound<'_, PyTuple>,
+        ) -> PyResult<()> {
+            // Lazy gate: args are never touched when the level is disabled.
             let max_level = self.level.load(Ordering::Relaxed);
-            if level_to_u8(level) <= max_level {
+            if level_to_u8(level) > max_level {
+                return Ok(());
+            }
+            let batch_size = BATCH_SIZE.load(Ordering::Relaxed);
+
+            if args.is_empty() {
+                // Verbatim, no % processing — matches stdlib logging.
+                let msg = message.to_str()?;
                 emit(
                     &self.writer.tx,
-                    BATCH_SIZE.load(Ordering::Relaxed),
+                    batch_size,
                     self.writer.unix_ts,
                     self.name.as_deref(),
                     level,
-                    |buf| buf.extend_from_slice(message.as_bytes()),
+                    |buf| buf.extend_from_slice(msg.as_bytes()),
+                );
+                return Ok(());
+            }
+
+            // Render into per-thread scratch before committing to the batch
+            // buffer: a Python __str__/__repr__ may raise mid-render, and a
+            // half-written line must never reach `emit`. Taken with
+            // `mem::take` (not a held borrow) so a reentrant log call from
+            // inside __str__ cannot hit a RefCell double-borrow.
+            let mut scratch = PRODUCER.with(|p| std::mem::take(&mut p.borrow_mut().scratch));
+            let result = render_message(&mut scratch, message, args);
+            if result.is_ok() {
+                emit(
+                    &self.writer.tx,
+                    batch_size,
+                    self.writer.unix_ts,
+                    self.name.as_deref(),
+                    level,
+                    |buf| buf.extend_from_slice(&scratch),
                 );
             }
+            scratch.clear();
+            PRODUCER.with(|p| p.borrow_mut().scratch = scratch);
+            result
         }
     }
 

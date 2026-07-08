@@ -76,12 +76,28 @@ logging.basicConfig(
     level=logging.INFO,
     name_levels={"db": logging.DEBUG, "http.client": logging.WARNING},
 )
-logging.trace(message)
-logging.debug(message)
-logging.info(message)
-logging.warning(message)
-logging.error(message)
+logging.trace(message, *args)
+logging.debug(message, *args)
+logging.info(message, *args)
+logging.warning(message, *args)
+logging.error(message, *args)
 ```
+
+### 延迟 %-格式化
+
+与标准库 `logging` 一样，额外参数会以 %-风格格式化合并进消息——但仅在该日志级别启用时才会格式化。
+级别被禁用时，参数完全不会被格式化（不调用 `str()`/`repr()`），被禁用的日志调用几乎零开销：
+
+```python
+logger.info("price=%s qty=%s side=%s", price, qty, side)
+logger.debug("state=%r retries=%d", state, retries)  # INFO 级别下零成本
+```
+
+支持的转换符：`%s` `%r` `%d` `%i` `%f` `%e` `%g` `%x` `%o` `%%`，
+并完整支持 `%` 运算符规格（宽度、精度、标志、配合 dict 参数的 `%(name)s`），
+语义与 Python 的 `message % args` 完全一致。简单占位符由 Rust 原生渲染——
+带参数的格式化比在调用点用 f-string 拼接消息更快。
+不带参数的消息原样输出，字面 `%` 无需转义。
 
 ### Logger 类
 

@@ -76,12 +76,31 @@ logging.basicConfig(
     level=logging.INFO,
     name_levels={"db": logging.DEBUG, "http.client": logging.WARNING},
 )
-logging.trace(message)
-logging.debug(message)
-logging.info(message)
-logging.warning(message)
-logging.error(message)
+logging.trace(message, *args)
+logging.debug(message, *args)
+logging.info(message, *args)
+logging.warning(message, *args)
+logging.error(message, *args)
 ```
+
+### Lazy %-style Formatting
+
+Like the standard `logging` module, extra arguments are merged into the
+message with %-style formatting — but only if the log level is enabled.
+When the level is disabled, the arguments are never formatted (no
+`str()`/`repr()` calls), making disabled log calls nearly free:
+
+```python
+logger.info("price=%s qty=%s side=%s", price, qty, side)
+logger.debug("state=%r retries=%d", state, retries)  # zero cost at INFO level
+```
+
+Supported conversions: `%s` `%r` `%d` `%i` `%f` `%e` `%g` `%x` `%o` `%%`,
+plus the full `%` operator spec (width, precision, flags, `%(name)s` with a
+dict argument) with semantics identical to Python's `message % args`. Simple
+placeholders are rendered natively in Rust — formatting with args is faster
+than building the message with an f-string at the call site. A message
+logged without args is emitted verbatim, so literal `%` needs no escaping.
 
 ### Logger Class
 
