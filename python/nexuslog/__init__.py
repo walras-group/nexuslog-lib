@@ -49,6 +49,7 @@ def basicConfig(
     name_levels: dict[str | None, Level] | None = None,
     unix_ts: bool = False,
     batch_size: int | None = None,
+    color: str = "auto",
 ) -> None:
     """Configure the root logger.
 
@@ -60,9 +61,19 @@ def basicConfig(
         unix_ts: If True, emit unix timestamps instead of formatted local time.
         batch_size: Number of log entries to batch before writing. Default is 32.
                     Set to 1 to write immediately (lower performance, no data loss on crash).
+        color: Colorize output. One of:
+               "auto" (default) — color only when writing to a color-capable
+               terminal (honoring the NO_COLOR / FORCE_COLOR env vars); files
+               and pipes stay plain.
+               "off" — never emit ANSI color.
+               "always" — always emit ANSI color, even to files and pipes.
     """
+    if color not in ("auto", "off", "always"):
+        raise ValueError(
+            f"color must be 'auto', 'off', or 'always', got {color!r}"
+        )
     global _DEFAULT_LEVEL, _NAME_LEVELS, _root_logger
-    _basic_config(filename, unix_ts, batch_size)
+    _basic_config(filename, unix_ts, batch_size, color)
     _DEFAULT_LEVEL = level
     _NAME_LEVELS = {} if name_levels is None else dict(name_levels)
     # Create root logger

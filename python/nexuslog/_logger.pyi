@@ -20,6 +20,9 @@ class PyLogger:
     def error(self, message: str, *args: object) -> None: ...
 
 def basic_config(
-    path: str | None = None, unix_ts: bool = False, batch_size: int | None = None
+    path: str | None = None,
+    unix_ts: bool = False,
+    batch_size: int | None = None,
+    color: str = "auto",
 ) -> None: ...
 def get_logger(name: str | None, level: PyLevel = PyLevel.Info) -> PyLogger: ...

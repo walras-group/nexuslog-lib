@@ -71,7 +71,7 @@ logging.ERROR
 ### Module-level Functions
 
 ```python
-logging.basicConfig(filename=None, level=logging.INFO, unix_ts=False)
+logging.basicConfig(filename=None, level=logging.INFO, unix_ts=False, color="auto")
 logging.basicConfig(
     level=logging.INFO,
     name_levels={"db": logging.DEBUG, "http.client": logging.WARNING},
@@ -101,6 +101,25 @@ dict argument) with semantics identical to Python's `message % args`. Simple
 placeholders are rendered natively in Rust — formatting with args is faster
 than building the message with an f-string at the call site. A message
 logged without args is emitted verbatim, so literal `%` needs no escaping.
+
+### Colored Output
+
+```python
+logging.basicConfig(color="auto")  # default
+```
+
+The `color` option controls ANSI colorization of the level value (by
+severity) and the logfmt keys (dimmed):
+
+- `"auto"` (default) — color only when writing to a color-capable terminal.
+  File and piped output stay plain. Honors the `NO_COLOR` (force off) and
+  `FORCE_COLOR` (force on) environment variables; `NO_COLOR` wins.
+- `"off"` — never emit ANSI color.
+- `"always"` — always emit ANSI color, even to files and pipes.
+
+Colors: `error` red, `warn` yellow, `info` green, `debug` cyan, `trace` dim.
+The message body is never colored. There is no cost on the hot path when
+color is inactive.
 
 ### Logger Class
 

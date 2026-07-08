@@ -13,6 +13,15 @@ pub use log::{debug, error, info, trace, warn};
 pub type Level = LevelFilter;
 const CHANNEL_CAPACITY: usize = 65_536;
 const DEFAULT_BATCH_SIZE: usize = 32;
+
+// ANSI SGR sequences used when color output is enabled.
+const DIM: &str = "\x1b[2m";
+const RESET: &str = "\x1b[0m";
+
+/// Set to `true` the first time a coloring color mode (`auto`/`always`) is
+/// configured. Gates the (cold) building of colored prefixes in
+/// `TimestampCache::refresh` so the default, no-color path does no extra work.
+static COLOR_LIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 // Bytes reserved per producer batch buffer: DEFAULT_BATCH_SIZE lines * ~128 bytes.
 const BATCH_BUF_CAP: usize = 4096;
 
@@ -212,6 +221,7 @@ impl log::Log for Logger {
             &self.tx,
             DEFAULT_BATCH_SIZE,
             self.unix_ts,
+            false,
             self.name.as_deref(),
             record.level(),
             |buf| {
@@ -292,6 +302,11 @@ struct TimestampCache {
     time_prefix: String,
     offset_prefix: String,
     unix_prefix: String,
+    // Colored counterparts, built only when color output is live (COLOR_LIVE).
+    // Empty otherwise, so the default path pays nothing.
+    time_prefix_colored: String,
+    offset_colored: String,
+    unix_prefix_colored: String,
 }
 
 impl TimestampCache {
@@ -302,6 +317,9 @@ impl TimestampCache {
             time_prefix: String::new(),
             offset_prefix: String::new(),
             unix_prefix: String::new(),
+            time_prefix_colored: String::new(),
+            offset_colored: String::new(),
+            unix_prefix_colored: String::new(),
         }
     }
 
@@ -336,6 +354,16 @@ impl TimestampCache {
         );
         self.offset_prefix = format!("{offset_sign}{offset_h:02}:{offset_m:02} level=");
         self.unix_prefix = format!("time={secs}.");
+
+        // Colored prefixes reuse the plain ones (no date re-formatting) and are
+        // only built when a coloring writer exists. `write_prefix` re-triggers
+        // refresh if it finds these empty, so a mid-second flag flip is safe.
+        if COLOR_LIVE.load(std::sync::atomic::Ordering::Relaxed) {
+            self.time_prefix_colored = format!("{DIM}time={RESET}{}", &self.time_prefix["time=".len()..]);
+            let offset_only = &self.offset_prefix[..self.offset_prefix.len() - " level=".len()];
+            self.offset_colored = format!("{offset_only} {DIM}level={RESET}");
+            self.unix_prefix_colored = format!("{DIM}time={RESET}{}", &self.unix_prefix["time=".len()..]);
+        }
     }
 }
 
@@ -347,6 +375,19 @@ fn level_str(level: log::Level) -> &'static str {
         log::Level::Info => "info",
         log::Level::Warn => "warn",
         log::Level::Error => "error",
+    }
+}
+
+/// The level token wrapped in a severity color plus a trailing reset, so it
+/// can be appended with a single `extend_from_slice`.
+#[inline]
+fn level_str_colored(level: log::Level) -> &'static str {
+    match level {
+        log::Level::Trace => "\x1b[2mtrace\x1b[0m",
+        log::Level::Debug => "\x1b[36mdebug\x1b[0m",
+        log::Level::Info => "\x1b[32minfo\x1b[0m",
+        log::Level::Warn => "\x1b[33mwarn\x1b[0m",
+        log::Level::Error => "\x1b[31merror\x1b[0m",
     }
 }
 
@@ -372,7 +413,30 @@ fn push_pad(buf: &mut Vec<u8>, mut val: u32, width: usize) {
 }
 
 #[inline(always)]
-fn write_prefix(buf: &mut Vec<u8>, fmt: &TimestampCache, ts: Timestamp, level: log::Level, unix_ts: bool) {
+fn write_prefix(buf: &mut Vec<u8>, fmt: &mut TimestampCache, ts: Timestamp, level: log::Level, unix_ts: bool, color: bool) {
+    if color {
+        // A producer thread may have refreshed this second before a coloring
+        // writer was registered; rebuild the colored prefixes if so.
+        if fmt.time_prefix_colored.is_empty() {
+            fmt.refresh(ts.secs);
+        }
+        let level = level_str_colored(level);
+        if unix_ts {
+            buf.extend_from_slice(fmt.unix_prefix_colored.as_bytes());
+            push_pad(buf, ts.nanos, 9);
+            buf.extend_from_slice(b" ");
+            buf.extend_from_slice(DIM.as_bytes());
+            buf.extend_from_slice(b"level=");
+            buf.extend_from_slice(RESET.as_bytes());
+            buf.extend_from_slice(level.as_bytes());
+        } else {
+            buf.extend_from_slice(fmt.time_prefix_colored.as_bytes());
+            push_pad(buf, ts.nanos / 1_000, 6);
+            buf.extend_from_slice(fmt.offset_colored.as_bytes());
+            buf.extend_from_slice(level.as_bytes());
+        }
+        return;
+    }
     let level = level_str(level);
     if unix_ts {
         buf.extend_from_slice(fmt.unix_prefix.as_bytes());
@@ -395,6 +459,7 @@ fn emit<F: FnOnce(&mut Vec<u8>)>(
     tx: &Sender<Action>,
     batch_size: usize,
     unix_ts: bool,
+    color: bool,
     name: Option<&str>,
     level: log::Level,
     write_msg: F,
@@ -405,12 +470,27 @@ fn emit<F: FnOnce(&mut Vec<u8>)>(
         let Producer { fmt, buf, count, .. } = &mut *producer;
         fmt.update(ts.secs);
 
-        write_prefix(buf, fmt, ts, level, unix_ts);
+        write_prefix(buf, fmt, ts, level, unix_ts, color);
         if let Some(name) = name {
-            buf.extend_from_slice(b" name=");
+            if color {
+                buf.extend_from_slice(b" ");
+                buf.extend_from_slice(DIM.as_bytes());
+                buf.extend_from_slice(b"name=");
+                buf.extend_from_slice(RESET.as_bytes());
+            } else {
+                buf.extend_from_slice(b" name=");
+            }
             buf.extend_from_slice(name.as_bytes());
         }
-        buf.extend_from_slice(b" msg=\"");
+        if color {
+            buf.extend_from_slice(b" ");
+            buf.extend_from_slice(DIM.as_bytes());
+            buf.extend_from_slice(b"msg=");
+            buf.extend_from_slice(RESET.as_bytes());
+            buf.extend_from_slice(b"\"");
+        } else {
+            buf.extend_from_slice(b" msg=\"");
+        }
         write_msg(buf);
         buf.extend_from_slice(b"\"\n");
 
@@ -511,7 +591,7 @@ pub fn init<P: ToString + Send + 'static>(name: &str, path: Option<P>, level: Le
 mod python {
     use super::{
         emit, flush_producer, worker, Action, Context, LevelFilter, CHANNEL_CAPACITY,
-        DEFAULT_BATCH_SIZE, PRODUCER,
+        COLOR_LIVE, DEFAULT_BATCH_SIZE, PRODUCER,
     };
     use chrono::Local;
     use crossbeam_channel::Sender;
@@ -519,12 +599,50 @@ mod python {
     use pyo3::types::{PyDict, PyFloat, PyInt, PyString, PyTuple};
     use std::collections::HashMap;
     use std::hash::{Hash, Hasher};
-    use std::io::Write;
+    use std::io::{IsTerminal, Write};
     use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, OnceLock, Weak};
     use std::thread::JoinHandle;
 
     static BATCH_SIZE: AtomicUsize = AtomicUsize::new(DEFAULT_BATCH_SIZE);
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum ColorMode {
+        Off,
+        Auto,
+        Always,
+    }
+
+    fn parse_color(mode: &str) -> ColorMode {
+        match mode {
+            "off" => ColorMode::Off,
+            "always" => ColorMode::Always,
+            _ => ColorMode::Auto,
+        }
+    }
+
+    /// Resolve a color mode against a concrete destination into a single bool
+    /// carried on the writer. Runs once per writer creation, never per message.
+    fn resolve_color(mode: ColorMode, path: &Option<String>) -> bool {
+        match mode {
+            ColorMode::Off => false,
+            ColorMode::Always => true,
+            ColorMode::Auto => {
+                // `auto` only ever colors the stdout stream; files stay plain.
+                if path.is_some() {
+                    return false;
+                }
+                let non_empty = |k| std::env::var_os(k).is_some_and(|v| !v.is_empty());
+                if non_empty("NO_COLOR") {
+                    return false;
+                }
+                if std::env::var_os("FORCE_COLOR").is_some_and(|v| !v.is_empty() && v != "0") {
+                    return true;
+                }
+                std::io::stdout().is_terminal()
+            }
+        }
+    }
 
     #[derive(Clone, Eq)]
     enum PathKey {
@@ -557,11 +675,12 @@ mod python {
     struct SharedWriter {
         tx: Sender<Action>,
         unix_ts: bool,
+        color: bool,
         thread: Mutex<Option<JoinHandle<()>>>,
     }
 
     impl SharedWriter {
-        fn new(path: Option<String>, unix_ts: bool) -> Self {
+        fn new(path: Option<String>, unix_ts: bool, color: bool) -> Self {
             let (tx, rx) = crossbeam_channel::bounded(CHANNEL_CAPACITY);
             let ctx = Context {
                 rx,
@@ -577,6 +696,7 @@ mod python {
             SharedWriter {
                 tx,
                 unix_ts,
+                color,
                 thread: Mutex::new(Some(thread)),
             }
         }
@@ -611,6 +731,11 @@ mod python {
         &DEFAULT_UNIX_TS
     }
 
+    fn default_color_cell() -> &'static OnceLock<Mutex<ColorMode>> {
+        static DEFAULT_COLOR: OnceLock<Mutex<ColorMode>> = OnceLock::new();
+        &DEFAULT_COLOR
+    }
+
     fn default_path() -> Option<String> {
         default_path_cell()
             .get_or_init(|| Mutex::new(None))
@@ -626,6 +751,13 @@ mod python {
             .unwrap()
     }
 
+    fn default_color() -> ColorMode {
+        *default_color_cell()
+            .get_or_init(|| Mutex::new(ColorMode::Auto))
+            .lock()
+            .unwrap()
+    }
+
     fn set_default_path(path: Option<String>) {
         let cell = default_path_cell().get_or_init(|| Mutex::new(None));
         *cell.lock().unwrap() = path;
@@ -634,6 +766,17 @@ mod python {
     fn set_default_unix_ts(unix_ts: bool) {
         let cell = default_unix_ts_cell().get_or_init(|| Mutex::new(false));
         *cell.lock().unwrap() = unix_ts;
+    }
+
+    fn set_default_color(mode: ColorMode) {
+        // Flip the global gate so producer threads start building colored
+        // prefixes. Only ever set to true; a later `off` still leaves the (now
+        // harmless) colored prefixes built, which no writer will read.
+        if mode != ColorMode::Off {
+            COLOR_LIVE.store(true, Ordering::Relaxed);
+        }
+        let cell = default_color_cell().get_or_init(|| Mutex::new(ColorMode::Auto));
+        *cell.lock().unwrap() = mode;
     }
 
     fn shared_writer(path: Option<String>) -> Arc<SharedWriter> {
@@ -649,7 +792,8 @@ mod python {
             }
         }
 
-        let writer = Arc::new(SharedWriter::new(path, default_unix_ts()));
+        let color = resolve_color(default_color(), &path);
+        let writer = Arc::new(SharedWriter::new(path, default_unix_ts(), color));
         map.insert(key, Arc::downgrade(&writer));
         writer
     }
@@ -981,6 +1125,7 @@ mod python {
                     &self.writer.tx,
                     batch_size,
                     self.writer.unix_ts,
+                    self.writer.color,
                     self.name.as_deref(),
                     level,
                     |buf| buf.extend_from_slice(msg.as_bytes()),
@@ -1000,6 +1145,7 @@ mod python {
                     &self.writer.tx,
                     batch_size,
                     self.writer.unix_ts,
+                    self.writer.color,
                     self.name.as_deref(),
                     level,
                     |buf| buf.extend_from_slice(&scratch),
@@ -1015,10 +1161,16 @@ mod python {
     #[pyo3(name = "_logger")]
     pub fn logger_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
         #[pyfunction]
-        #[pyo3(signature = (path=None, unix_ts=false, batch_size=None))]
-        fn basic_config(path: Option<String>, unix_ts: bool, batch_size: Option<usize>) -> PyResult<()> {
+        #[pyo3(signature = (path=None, unix_ts=false, batch_size=None, color="auto".to_string()))]
+        fn basic_config(
+            path: Option<String>,
+            unix_ts: bool,
+            batch_size: Option<usize>,
+            color: String,
+        ) -> PyResult<()> {
             set_default_path(path);
             set_default_unix_ts(unix_ts);
+            set_default_color(parse_color(&color));
             if let Some(size) = batch_size {
                 BATCH_SIZE.store(size.max(1), Ordering::Relaxed);
             }

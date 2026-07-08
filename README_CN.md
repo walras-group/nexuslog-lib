@@ -71,7 +71,7 @@ logging.ERROR
 ### 模块级函数
 
 ```python
-logging.basicConfig(filename=None, level=logging.INFO, unix_ts=False)
+logging.basicConfig(filename=None, level=logging.INFO, unix_ts=False, color="auto")
 logging.basicConfig(
     level=logging.INFO,
     name_levels={"db": logging.DEBUG, "http.client": logging.WARNING},
@@ -98,6 +98,22 @@ logger.debug("state=%r retries=%d", state, retries)  # INFO 级别下零成本
 语义与 Python 的 `message % args` 完全一致。简单占位符由 Rust 原生渲染——
 带参数的格式化比在调用点用 f-string 拼接消息更快。
 不带参数的消息原样输出，字面 `%` 无需转义。
+
+### 彩色输出
+
+```python
+logging.basicConfig(color="auto")  # 默认
+```
+
+`color` 选项控制对级别值（按严重程度着色）和 logfmt 键（暗淡显示）的 ANSI 着色：
+
+- `"auto"`（默认）——仅当输出到支持颜色的终端时着色，文件和管道输出保持纯文本。
+  遵循 `NO_COLOR`（强制关闭）与 `FORCE_COLOR`（强制开启）环境变量，`NO_COLOR` 优先。
+- `"off"`——从不输出 ANSI 颜色。
+- `"always"`——始终输出 ANSI 颜色，即使写入文件或管道。
+
+配色：`error` 红、`warn` 黄、`info` 绿、`debug` 青、`trace` 暗淡。
+消息正文永不着色。颜色未启用时，热路径上没有任何额外开销。
 
 ### Logger 类
 
