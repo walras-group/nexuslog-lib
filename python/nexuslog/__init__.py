@@ -8,7 +8,7 @@ Usage:
 
 from ._logger import (
     PyLevel as Level,
-    PyLogger as _PyLogger,
+    PyLogger as Logger,
     get_logger as _get_logger,
     basic_config as _basic_config,
 )
@@ -69,44 +69,9 @@ def basicConfig(
     _root_logger = getLogger(None, level)
 
 
-class Logger:
-    """Fast async logger instance.
-
-    Args:
-        name: Logger name. If None, the name field is omitted in log output.
-        path: Optional file path prefix for log files. If None, logs to stdout.
-              Log files are rotated daily with format: {path}_YYYYMMDD.log
-        level: Minimum log level to record. Default is Level.Info.
-    """
-
-    def __init__(
-        self, name: str | None, path: str | None = None, level: Level = Level.Info
-    ) -> None:
-        self._logger = _PyLogger(name, path, level)
-
-    def shutdown(self) -> None:
-        """Shutdown the logger and flush remaining messages."""
-        self._logger.shutdown()
-
-    def trace(self, message: str) -> None:
-        """Log a trace message."""
-        self._logger.trace(message)
-
-    def debug(self, message: str) -> None:
-        """Log a debug message."""
-        self._logger.debug(message)
-
-    def info(self, message: str) -> None:
-        """Log an info message."""
-        self._logger.info(message)
-
-    def warning(self, message: str) -> None:
-        """Log a warning message."""
-        self._logger.warn(message)
-
-    def error(self, message: str) -> None:
-        """Log an error message."""
-        self._logger.error(message)
+# `Logger` is the Rust-backed logger itself (imported above as an alias for
+# PyLogger). Calls go straight into Rust with no intermediate Python frame.
+# It exposes trace/debug/info/warn/warning/error/shutdown.
 
 
 def getLogger(name: str | None = None, level: Level | None = None) -> Logger:
@@ -116,9 +81,7 @@ def getLogger(name: str | None = None, level: Level | None = None) -> Logger:
             level = _NAME_LEVELS[name]
         else:
             level = _DEFAULT_LEVEL
-    logger = Logger.__new__(Logger)
-    logger._logger = _get_logger(name, level)
-    return logger
+    return _get_logger(name, level)
 
 
 def _get_root_logger() -> Logger:

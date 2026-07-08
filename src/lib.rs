@@ -8,19 +8,38 @@ use std::{
     thread::JoinHandle,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use arrayvec::ArrayString;
 
 pub use log::{debug, error, info, trace, warn};
 pub type Level = LevelFilter;
 const CHANNEL_CAPACITY: usize = 65_536;
-const INLINE_MSG_CAP: usize = 256;
 const DEFAULT_BATCH_SIZE: usize = 32;
+// Bytes reserved per producer batch buffer: DEFAULT_BATCH_SIZE lines * ~128 bytes.
+const BATCH_BUF_CAP: usize = 4096;
 
 thread_local! {
-    static TS_CACHE: RefCell<ThreadTimestampCache> =
-        RefCell::new(ThreadTimestampCache::new());
-    static ENTRY_BUFFER: RefCell<Vec<LogEntry>> =
-        RefCell::new(Vec::with_capacity(DEFAULT_BATCH_SIZE));
+    static PRODUCER: RefCell<Producer> = RefCell::new(Producer::new());
+}
+
+/// Per-thread producer state: monotonic timestamp source, formatting cache, and
+/// the byte buffer that log lines are rendered into before being shipped to the
+/// writer thread. Keeping it all in one thread-local means a single TLS lookup
+/// and a single borrow on the hot path.
+struct Producer {
+    ts: ThreadTimestampCache,
+    fmt: TimestampCache,
+    buf: Vec<u8>,
+    count: usize,
+}
+
+impl Producer {
+    fn new() -> Self {
+        Self {
+            ts: ThreadTimestampCache::new(),
+            fmt: TimestampCache::new(),
+            buf: Vec::with_capacity(BATCH_BUF_CAP),
+            count: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -29,51 +48,64 @@ struct Timestamp {
     nanos: u32,
 }
 
-#[derive(Debug)]
-struct LogEntry {
-    ts: Timestamp,
-    name: Option<Arc<str>>,
-    level: log::Level,
-    msg: LogMessage,
+/// Monotonic clock read as raw nanoseconds since an arbitrary epoch.
+///
+/// This is the single per-message time source on the hot path, so it is worth
+/// reading the OS clock as directly as possible. `std::time::Instant::now()`
+/// wraps the same underlying source but adds ~10ns of timebase conversion and
+/// `Duration` construction per call; going straight to the platform primitive
+/// roughly halves the cost while keeping full nanosecond precision.
+#[cfg(target_os = "macos")]
+#[inline(always)]
+fn mono_ns() -> u64 {
+    // `mach_absolute_time` returns ticks; `mach_timebase_info` gives the
+    // ticks->ns ratio (1:1 on Apple Silicon and modern x86_64 Macs). Both live
+    // in libSystem, which is always linked.
+    #[repr(C)]
+    struct MachTimebaseInfo {
+        numer: u32,
+        denom: u32,
+    }
+    extern "C" {
+        fn mach_absolute_time() -> u64;
+        fn mach_timebase_info(info: *mut MachTimebaseInfo) -> std::os::raw::c_int;
+    }
+
+    // Cache the timebase ratio once, packed as (numer << 32 | denom) in a
+    // single atomic so numer/denom are always read consistently. `0` means
+    // "not yet initialized" (mach_timebase_info never returns denom == 0).
+    static RATIO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    use std::sync::atomic::Ordering::Relaxed;
+
+    let ticks = unsafe { mach_absolute_time() };
+    let mut packed = RATIO.load(Relaxed);
+    if packed == 0 {
+        let mut info = MachTimebaseInfo { numer: 0, denom: 0 };
+        unsafe { mach_timebase_info(&mut info) };
+        packed = ((info.numer as u64) << 32) | info.denom as u64;
+        RATIO.store(packed, Relaxed);
+    }
+    let numer = (packed >> 32) as u32;
+    let denom = packed as u32;
+    if numer == denom {
+        ticks
+    } else {
+        ((ticks as u128 * numer as u128) / denom as u128) as u64
+    }
 }
 
-impl LogEntry {
-    #[inline]
-    pub fn ts(&self) -> Timestamp {
-        self.ts
-    }
-    #[inline]
-    pub fn name(&self) -> Option<&str> {
-        self.name.as_deref()
-    }
-    #[inline]
-    pub fn level(&self) -> log::Level {
-        self.level
-    }
-    #[inline]
-    pub fn msg(&self) -> &str {
-        self.msg.as_str()
-    }
-}
-
-#[derive(Debug)]
-enum LogMessage {
-    Inline(ArrayString<INLINE_MSG_CAP>),
-    Heap(String),
-}
-
-impl LogMessage {
-    #[inline]
-    fn as_str(&self) -> &str {
-        match self {
-            LogMessage::Inline(msg) => msg.as_str(),
-            LogMessage::Heap(msg) => msg.as_str(),
-        }
-    }
+#[cfg(not(target_os = "macos"))]
+#[inline(always)]
+fn mono_ns() -> u64 {
+    // Portable fallback: same source `Instant` uses, so behavior matches the
+    // previous implementation on non-macOS targets.
+    use std::sync::OnceLock;
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_nanos() as u64
 }
 
 struct ThreadTimestampCache {
-    base_instant: Instant,
+    base_ticks: u64,
     base_secs: u64,
     base_nanos: u32,
 }
@@ -82,36 +114,46 @@ impl ThreadTimestampCache {
     fn new() -> Self {
         let ts = now_timestamp();
         Self {
-            base_instant: Instant::now(),
+            base_ticks: mono_ns(),
             base_secs: ts.secs,
             base_nanos: ts.nanos,
         }
     }
 
+    #[cold]
     fn refresh(&mut self) -> Timestamp {
         let ts = now_timestamp();
-        self.base_instant = Instant::now();
+        self.base_ticks = mono_ns();
         self.base_secs = ts.secs;
         self.base_nanos = ts.nanos;
         ts
     }
 
+    #[inline(always)]
     fn now(&mut self) -> Timestamp {
-        let elapsed = self.base_instant.elapsed();
-        if elapsed >= Duration::from_secs(1) {
+        // Monotonic ns elapsed since the last wall-clock sync.
+        let elapsed = mono_ns().wrapping_sub(self.base_ticks);
+        if elapsed >= 1_000_000_000 {
             return self.refresh();
         }
 
-        let elapsed_nanos = elapsed.as_nanos() as u64;
-        let total_nanos = self.base_nanos as u64 + elapsed_nanos;
+        // `base_nanos` < 1e9 and `elapsed` < 1e9, so the sum needs at most a
+        // single carry into seconds — no division required.
+        let total_nanos = self.base_nanos as u64 + elapsed;
+        let (carry, nanos) = if total_nanos >= 1_000_000_000 {
+            (1, (total_nanos - 1_000_000_000) as u32)
+        } else {
+            (0, total_nanos as u32)
+        };
         Timestamp {
-            secs: self.base_secs + (total_nanos / 1_000_000_000),
-            nanos: (total_nanos % 1_000_000_000) as u32,
+            secs: self.base_secs + carry,
+            nanos,
         }
     }
 }
+
 enum Action {
-    WriteBatch(Vec<LogEntry>),
+    WriteBytes(Vec<u8>),
     Flush,
     Exit,
 }
@@ -121,7 +163,6 @@ struct Context<P: ToString + Send> {
     rx: Receiver<Action>,
     path: Option<P>,
     date: chrono::NaiveDate,
-    unix_ts: bool,
 }
 
 pub struct Handle {
@@ -146,6 +187,7 @@ impl Drop for Handle {
 struct Logger {
     tx: Sender<Action>,
     name: Option<Arc<str>>,
+    unix_ts: bool,
 }
 
 impl log::Log for Logger {
@@ -158,28 +200,20 @@ impl log::Log for Logger {
             return;
         }
 
-        let msg = {
-            let mut inline = ArrayString::<INLINE_MSG_CAP>::new();
-            use std::fmt::Write as _;
-            if write!(&mut inline, "{}", record.args()).is_ok() {
-                LogMessage::Inline(inline)
-            } else {
-                LogMessage::Heap(record.args().to_string())
-            }
-        };
-
-        let entry = LogEntry {
-            ts: cached_timestamp(),
-            name: self.name.as_ref().map(Arc::clone),
-            level: record.level(),
-            msg,
-        };
-
-        push_entry(&self.tx, entry);
+        emit(
+            &self.tx,
+            DEFAULT_BATCH_SIZE,
+            self.unix_ts,
+            self.name.as_deref(),
+            record.level(),
+            |buf| {
+                let _ = std::io::Write::write_fmt(buf, *record.args());
+            },
+        );
     }
 
     fn flush(&self) {
-        flush_thread_buffer(&self.tx);
+        flush_producer(&self.tx);
         let _ = self.tx.send(Action::Flush);
     }
 }
@@ -241,21 +275,11 @@ fn now_timestamp() -> Timestamp {
     }
 }
 
-fn cached_timestamp() -> Timestamp {
-    TS_CACHE.with(|cache| cache.borrow_mut().now())
-}
-
+/// Formatting cache refreshed at most once per wall-clock second. Holds the
+/// pre-rendered, second-granularity prefixes so the per-message hot path only
+/// appends the sub-second digits.
 struct TimestampCache {
     last_secs: u64,
-    year: i32,
-    month: u32,
-    day: u32,
-    hour: u32,
-    minute: u32,
-    second: u32,
-    offset_sign: char,
-    offset_h: i32,
-    offset_m: i32,
     date: chrono::NaiveDate,
     time_prefix: String,
     offset_prefix: String,
@@ -266,15 +290,6 @@ impl TimestampCache {
     fn new() -> Self {
         Self {
             last_secs: u64::MAX,
-            year: 0,
-            month: 0,
-            day: 0,
-            hour: 0,
-            minute: 0,
-            second: 0,
-            offset_sign: '+',
-            offset_h: 0,
-            offset_m: 0,
             date: chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap(),
             time_prefix: String::new(),
             offset_prefix: String::new(),
@@ -282,35 +297,133 @@ impl TimestampCache {
         }
     }
 
+    #[inline]
     fn update(&mut self, secs: u64) {
         if self.last_secs == secs {
             return;
         }
+        self.refresh(secs);
+    }
 
+    #[cold]
+    fn refresh(&mut self, secs: u64) {
         let dt: DateTime<Local> = DateTime::from(UNIX_EPOCH + Duration::from_secs(secs));
         self.last_secs = secs;
-        self.year = dt.year();
-        self.month = dt.month();
-        self.day = dt.day();
-        self.hour = dt.hour();
-        self.minute = dt.minute();
-        self.second = dt.second();
         self.date = dt.date_naive();
 
         let offset = dt.offset().local_minus_utc();
-        self.offset_sign = if offset >= 0 { '+' } else { '-' };
+        let offset_sign = if offset >= 0 { '+' } else { '-' };
         let offset_abs = offset.abs();
-        self.offset_h = offset_abs / 3600;
-        self.offset_m = (offset_abs % 3600) / 60;
+        let offset_h = offset_abs / 3600;
+        let offset_m = (offset_abs % 3600) / 60;
 
         self.time_prefix = format!(
             "time={:04}-{:02}-{:02}T{:02}:{:02}:{:02}.",
-            self.year, self.month, self.day, self.hour, self.minute, self.second
+            dt.year(),
+            dt.month(),
+            dt.day(),
+            dt.hour(),
+            dt.minute(),
+            dt.second()
         );
-        self.offset_prefix =
-            format!("{}{:02}:{:02} level=", self.offset_sign, self.offset_h, self.offset_m);
-        self.unix_prefix = format!("time={}.", secs);
+        self.offset_prefix = format!("{offset_sign}{offset_h:02}:{offset_m:02} level=");
+        self.unix_prefix = format!("time={secs}.");
     }
+}
+
+#[inline]
+fn level_str(level: log::Level) -> &'static str {
+    match level {
+        log::Level::Trace => "trace",
+        log::Level::Debug => "debug",
+        log::Level::Info => "info",
+        log::Level::Warn => "warn",
+        log::Level::Error => "error",
+    }
+}
+
+/// Append `val` to `buf` as exactly `width` ASCII digits, zero-padded. Avoids
+/// the `core::fmt` width machinery on the hot path.
+#[inline(always)]
+fn push_pad(buf: &mut Vec<u8>, mut val: u32, width: usize) {
+    let mut tmp = [0u8; 10];
+    let mut i = tmp.len();
+    loop {
+        i -= 1;
+        tmp[i] = b'0' + (val % 10) as u8;
+        val /= 10;
+        if val == 0 {
+            break;
+        }
+    }
+    let ndigits = tmp.len() - i;
+    for _ in ndigits..width {
+        buf.push(b'0');
+    }
+    buf.extend_from_slice(&tmp[i..]);
+}
+
+#[inline(always)]
+fn write_prefix(buf: &mut Vec<u8>, fmt: &TimestampCache, ts: Timestamp, level: log::Level, unix_ts: bool) {
+    let level = level_str(level);
+    if unix_ts {
+        buf.extend_from_slice(fmt.unix_prefix.as_bytes());
+        push_pad(buf, ts.nanos, 9);
+        buf.extend_from_slice(b" level=");
+        buf.extend_from_slice(level.as_bytes());
+    } else {
+        buf.extend_from_slice(fmt.time_prefix.as_bytes());
+        push_pad(buf, ts.nanos / 1_000, 6);
+        buf.extend_from_slice(fmt.offset_prefix.as_bytes());
+        buf.extend_from_slice(level.as_bytes());
+    }
+}
+
+/// Render one log line into the calling thread's buffer and, once a full batch
+/// has accumulated, ship the raw bytes to the writer thread. `write_msg` writes
+/// the message body directly into the buffer, avoiding any intermediate copy.
+#[inline]
+fn emit<F: FnOnce(&mut Vec<u8>)>(
+    tx: &Sender<Action>,
+    batch_size: usize,
+    unix_ts: bool,
+    name: Option<&str>,
+    level: log::Level,
+    write_msg: F,
+) {
+    PRODUCER.with(|producer| {
+        let mut producer = producer.borrow_mut();
+        let ts = producer.ts.now();
+        let Producer { fmt, buf, count, .. } = &mut *producer;
+        fmt.update(ts.secs);
+
+        write_prefix(buf, fmt, ts, level, unix_ts);
+        if let Some(name) = name {
+            buf.extend_from_slice(b" name=");
+            buf.extend_from_slice(name.as_bytes());
+        }
+        buf.extend_from_slice(b" msg=\"");
+        write_msg(buf);
+        buf.extend_from_slice(b"\"\n");
+
+        *count += 1;
+        if *count >= batch_size {
+            let batch = std::mem::replace(buf, Vec::with_capacity(BATCH_BUF_CAP));
+            *count = 0;
+            let _ = tx.send(Action::WriteBytes(batch));
+        }
+    });
+}
+
+fn flush_producer(tx: &Sender<Action>) {
+    PRODUCER.with(|producer| {
+        let mut producer = producer.borrow_mut();
+        if !producer.buf.is_empty() {
+            let batch = std::mem::replace(&mut producer.buf, Vec::with_capacity(BATCH_BUF_CAP));
+            producer.count = 0;
+            let _ = tx.send(Action::WriteBytes(batch));
+        }
+    });
 }
 
 fn worker<P: ToString + Send>(mut ctx: Context<P>) -> Result<(), std::io::Error> {
@@ -318,13 +431,10 @@ fn worker<P: ToString + Send>(mut ctx: Context<P>) -> Result<(), std::io::Error>
 
     let mut target = rotate(&ctx)?;
     let mut last_flush = Instant::now();
-    let mut cache = TimestampCache::new();
     loop {
         match ctx.rx.recv_timeout(timeout) {
-            Ok(Action::WriteBatch(entries)) => {
-                for entry in entries {
-                    write_entry(&mut target, &mut ctx, &mut cache, entry)?;
-                }
+            Ok(Action::WriteBytes(bytes)) => {
+                target.write_all(&bytes)?;
             }
             Ok(Action::Flush) => {
                 target.flush()?;
@@ -339,76 +449,19 @@ fn worker<P: ToString + Send>(mut ctx: Context<P>) -> Result<(), std::io::Error>
 
         if last_flush.elapsed() >= Duration::from_secs(1) {
             last_flush = Instant::now();
+            // Roll over to a new dated file when the local day changes.
+            if ctx.path.is_some() {
+                let today = Local::now().date_naive();
+                if today != ctx.date {
+                    ctx.date = today;
+                    target = rotate(&ctx)?;
+                }
+            }
             target.flush()?;
         }
     }
 
     Ok(())
-}
-
-fn write_entry<P: ToString + Send>(
-    target: &mut BufWriter<Box<dyn Write>>,
-    ctx: &mut Context<P>,
-    cache: &mut TimestampCache,
-    entry: LogEntry,
-) -> Result<(), std::io::Error> {
-    let ts = entry.ts();
-    cache.update(ts.secs);
-
-    if cache.date != ctx.date {
-        ctx.date = cache.date;
-        *target = rotate(ctx)?;
-    }
-
-    let level = match entry.level() {
-        log::Level::Trace => "trace",
-        log::Level::Debug => "debug",
-        log::Level::Info => "info",
-        log::Level::Warn => "warn",
-        log::Level::Error => "error",
-    };
-
-    if ctx.unix_ts {
-        target.write_all(cache.unix_prefix.as_bytes())?;
-        write!(target, "{:09} level={}", ts.nanos, level)?;
-    } else {
-        target.write_all(cache.time_prefix.as_bytes())?;
-        write!(target, "{:06}", ts.nanos / 1_000)?;
-        target.write_all(cache.offset_prefix.as_bytes())?;
-        target.write_all(level.as_bytes())?;
-    }
-
-    if let Some(name) = entry.name() {
-        target.write_all(b" name=")?;
-        target.write_all(name.as_bytes())?;
-    }
-    target.write_all(b" msg=\"")?;
-    target.write_all(entry.msg().as_bytes())?;
-    target.write_all(b"\"\n")?;
-    Ok(())
-}
-
-fn push_entry(tx: &Sender<Action>, entry: LogEntry) {
-    ENTRY_BUFFER.with(|buffer| {
-        let mut buffer = buffer.borrow_mut();
-        buffer.push(entry);
-        if buffer.len() >= DEFAULT_BATCH_SIZE {
-            let mut batch = Vec::with_capacity(DEFAULT_BATCH_SIZE);
-            std::mem::swap(&mut *buffer, &mut batch);
-            let _ = tx.send(Action::WriteBatch(batch));
-        }
-    });
-}
-
-fn flush_thread_buffer(tx: &Sender<Action>) {
-    ENTRY_BUFFER.with(|buffer| {
-        let mut buffer = buffer.borrow_mut();
-        if !buffer.is_empty() {
-            let mut batch = Vec::with_capacity(buffer.len());
-            std::mem::swap(&mut *buffer, &mut batch);
-            let _ = tx.send(Action::WriteBatch(batch));
-        }
-    });
 }
 
 pub fn init<P: ToString + Send + 'static>(name: &str, path: Option<P>, level: Level) -> Handle {
@@ -418,12 +471,12 @@ pub fn init<P: ToString + Send + 'static>(name: &str, path: Option<P>, level: Le
         rx,
         path,
         date: Local::now().date_naive(),
-        unix_ts: false,
     };
 
     let logger = Logger {
         tx: tx.clone(),
         name: Some(Arc::from(name)),
+        unix_ts: false,
     };
 
     log::set_boxed_logger(Box::new(logger)).expect("error to init logger");
@@ -445,8 +498,8 @@ pub fn init<P: ToString + Send + 'static>(name: &str, path: Option<P>, level: Le
 #[cfg(feature = "python")]
 mod python {
     use super::{
-        cached_timestamp, flush_thread_buffer, worker, Action, Context, LogEntry,
-        LogMessage, LevelFilter, CHANNEL_CAPACITY, DEFAULT_BATCH_SIZE, INLINE_MSG_CAP,
+        emit, flush_producer, worker, Action, Context, LevelFilter, CHANNEL_CAPACITY,
+        DEFAULT_BATCH_SIZE,
     };
     use chrono::Local;
     use crossbeam_channel::Sender;
@@ -456,23 +509,8 @@ mod python {
     use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, OnceLock, Weak};
     use std::thread::JoinHandle;
-    use arrayvec::ArrayString;
 
     static BATCH_SIZE: AtomicUsize = AtomicUsize::new(DEFAULT_BATCH_SIZE);
-
-    fn push_entry(tx: &Sender<Action>, entry: LogEntry) {
-        use super::ENTRY_BUFFER;
-        let batch_size = BATCH_SIZE.load(Ordering::Relaxed);
-        ENTRY_BUFFER.with(|buffer| {
-            let mut buffer = buffer.borrow_mut();
-            buffer.push(entry);
-            if buffer.len() >= batch_size {
-                let mut batch = Vec::with_capacity(batch_size);
-                std::mem::swap(&mut *buffer, &mut batch);
-                let _ = tx.send(Action::WriteBatch(batch));
-            }
-        });
-    }
 
     #[derive(Clone, Eq)]
     enum PathKey {
@@ -504,6 +542,7 @@ mod python {
 
     struct SharedWriter {
         tx: Sender<Action>,
+        unix_ts: bool,
         thread: Mutex<Option<JoinHandle<()>>>,
     }
 
@@ -514,7 +553,6 @@ mod python {
                 rx,
                 path,
                 date: Local::now().date_naive(),
-                unix_ts,
             };
             let thread = std::thread::spawn(move || {
                 if let Err(msg) = worker(ctx) {
@@ -524,6 +562,7 @@ mod python {
 
             SharedWriter {
                 tx,
+                unix_ts,
                 thread: Mutex::new(Some(thread)),
             }
         }
@@ -665,7 +704,7 @@ mod python {
         }
 
         fn shutdown(&self) {
-            flush_thread_buffer(&self.writer.tx);
+            flush_producer(&self.writer.tx);
             let _ = self.writer.tx.send(Action::Flush);
             if Arc::strong_count(&self.writer) == 1 {
                 self.writer.stop();
@@ -688,6 +727,11 @@ mod python {
             self.log_internal(log::Level::Warn, message);
         }
 
+        // `warning` mirrors the stdlib `logging` name; `warn` is kept as an alias.
+        fn warning(&self, message: &str) {
+            self.log_internal(log::Level::Warn, message);
+        }
+
         fn error(&self, message: &str) {
             self.log_internal(log::Level::Error, message);
         }
@@ -698,21 +742,14 @@ mod python {
         fn log_internal(&self, level: log::Level, message: &str) {
             let max_level = self.level.load(Ordering::Relaxed);
             if level_to_u8(level) <= max_level {
-                let msg = {
-                    let mut inline = ArrayString::<INLINE_MSG_CAP>::new();
-                    if inline.try_push_str(message).is_ok() {
-                        LogMessage::Inline(inline)
-                    } else {
-                        LogMessage::Heap(message.to_owned())
-                    }
-                };
-                let entry = LogEntry {
-                    ts: cached_timestamp(),
-                    name: self.name.as_ref().map(Arc::clone),
+                emit(
+                    &self.writer.tx,
+                    BATCH_SIZE.load(Ordering::Relaxed),
+                    self.writer.unix_ts,
+                    self.name.as_deref(),
                     level,
-                    msg,
-                };
-                push_entry(&self.writer.tx, entry);
+                    |buf| buf.extend_from_slice(message.as_bytes()),
+                );
             }
         }
     }

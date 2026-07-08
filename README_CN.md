@@ -18,24 +18,21 @@
 Benchmarking with 1,000,000 log messages
 
 ------------------------------------------------------------
-Logger               Time (s)     Msgs/sec        Log size    
+Logger               Time (s)     Msgs/sec        Log size
 ------------------------------------------------------------
-Python logging       5.237        190,954         82,888,890 bytes
-loguru               7.039        142,070         89,888,890 bytes
-picologging          1.999        500,306         79,888,882 bytes
-spdlog               0.298        3,358,706       79,888,890 bytes
-NexusLogger          0.131        7,654,750       97,888,890 bytes
-NexusLogger unix_ts  0.127        7,874,086       82,888,890 bytes
+loguru               8.150        122,696         89,888,890 bytes
+Python logging       5.675        176,226         82,888,890 bytes
+spdlog               0.260        3,850,774       79,888,890 bytes
+NexusLogger unix_ts  0.116        8,608,575       85,888,890 bytes
+NexusLogger          0.114        8,765,093       97,888,890 bytes
 ------------------------------------------------------------
 
-NexusLogger is 40.09x faster than Python logging
-NexusLogger is 53.88x faster than loguru
-NexusLogger is 15.30x faster than picologging
+NexusLogger is 49.74x faster than Python logging
+NexusLogger is 71.44x faster than loguru
 NexusLogger is 2.28x faster than spdlog
-NexusLogger unix_ts is 41.24x faster than Python logging
-NexusLogger unix_ts is 55.42x faster than loguru
-NexusLogger unix_ts is 15.74x faster than picologging
-NexusLogger unix_ts is 2.34x faster than spdlog
+NexusLogger unix_ts is 48.85x faster than Python logging
+NexusLogger unix_ts is 70.16x faster than loguru
+NexusLogger unix_ts is 2.24x faster than spdlog
 ```
 
 ## 安装

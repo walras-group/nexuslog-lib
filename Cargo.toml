@@ -1,6 +1,6 @@
 [package]
 name = "nexuslog"
-version = "0.4.4"
+version = "0.6.0"
 edition = "2021"
 license = "MIT"
 description = "Fast async logger with Python bindings"
@@ -17,8 +17,15 @@ chrono = "0.4.43"
 crossbeam-channel = "0.5.15"
 log = { version = "0.4.29", features = ["std"] }
 pyo3 = { version = "0.27.2", optional = true }
-arrayvec = "0.7.4"
 
 [features]
 default = []
 python = ["pyo3", "pyo3/extension-module"]
+
+# Aggressive optimization for the published extension module. LTO across the
+# single codegen unit lets the compiler inline the hot log path end-to-end.
+# (panic=abort is intentionally avoided: pyo3 unwinds Rust panics into Python
+# exceptions.)
+[profile.release]
+lto = "fat"
+codegen-units = 1
