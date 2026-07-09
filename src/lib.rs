@@ -22,6 +22,11 @@ const RESET: &str = "\x1b[0m";
 /// configured. Gates the (cold) building of colored prefixes in
 /// `TimestampCache::refresh` so the default, no-color path does no extra work.
 static COLOR_LIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Set to `true` the first time JSON output is configured. Gates the (cold)
+/// building of JSON prefixes in `TimestampCache::refresh` so the default
+/// (logfmt) path does no extra work.
+static JSON_LIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 // Bytes reserved per producer batch buffer: DEFAULT_BATCH_SIZE lines * ~128 bytes.
 const BATCH_BUF_CAP: usize = 4096;
 
@@ -222,6 +227,7 @@ impl log::Log for Logger {
             DEFAULT_BATCH_SIZE,
             self.unix_ts,
             false,
+            false,
             self.name.as_deref(),
             record.level(),
             |buf| {
@@ -307,6 +313,10 @@ struct TimestampCache {
     time_prefix_colored: String,
     offset_colored: String,
     unix_prefix_colored: String,
+    // JSON counterparts, built only when JSON output is live (JSON_LIVE).
+    time_prefix_json: String,
+    offset_json: String,
+    unix_prefix_json: String,
 }
 
 impl TimestampCache {
@@ -320,6 +330,9 @@ impl TimestampCache {
             time_prefix_colored: String::new(),
             offset_colored: String::new(),
             unix_prefix_colored: String::new(),
+            time_prefix_json: String::new(),
+            offset_json: String::new(),
+            unix_prefix_json: String::new(),
         }
     }
 
@@ -364,6 +377,17 @@ impl TimestampCache {
             self.offset_colored = format!("{offset_only} {DIM}level={RESET}");
             self.unix_prefix_colored = format!("{DIM}time={RESET}{}", &self.unix_prefix["time=".len()..]);
         }
+
+        // JSON prefixes, likewise reusing the plain parts and gated on JSON_LIVE.
+        if JSON_LIVE.load(std::sync::atomic::Ordering::Relaxed) {
+            // {"time":"YYYY-MM-DDThh:mm:ss.
+            self.time_prefix_json = format!("{{\"time\":\"{}", &self.time_prefix["time=".len()..]);
+            // +HH:MM","level":"
+            let offset_only = &self.offset_prefix[..self.offset_prefix.len() - " level=".len()];
+            self.offset_json = format!("{offset_only}\",\"level\":\"");
+            // {"time":SECS.   (numeric time; JSON_LEVEL_SEP is appended after the digits)
+            self.unix_prefix_json = format!("{{\"time\":{}", &self.unix_prefix["time=".len()..]);
+        }
     }
 }
 
@@ -389,6 +413,41 @@ fn level_str_colored(level: log::Level) -> &'static str {
         log::Level::Warn => "\x1b[33mwarn\x1b[0m",
         log::Level::Error => "\x1b[31merror\x1b[0m",
     }
+}
+
+/// Opens the `level` field in the unix-timestamp JSON branch (the formatted
+/// branch bakes this into `offset_json`).
+const JSON_LEVEL_SEP: &[u8] = b",\"level\":\"";
+
+/// Append `bytes` to `out` with JSON string escaping. `bytes` must be valid
+/// UTF-8 (it always is here — from `PyString::to_str`); bytes >= 0x20 other
+/// than `"` and `\` pass through untouched, so the common case is a bulk copy.
+fn json_escape(out: &mut Vec<u8>, bytes: &[u8]) {
+    let mut start = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        let escaped: &[u8] = match b {
+            b'"' => b"\\\"",
+            b'\\' => b"\\\\",
+            b'\n' => b"\\n",
+            b'\r' => b"\\r",
+            b'\t' => b"\\t",
+            0x00..=0x1F => {
+                // Other control characters: \u00XX.
+                out.extend_from_slice(&bytes[start..i]);
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                out.extend_from_slice(b"\\u00");
+                out.push(HEX[(b >> 4) as usize]);
+                out.push(HEX[(b & 0xF) as usize]);
+                start = i + 1;
+                continue;
+            }
+            _ => continue,
+        };
+        out.extend_from_slice(&bytes[start..i]);
+        out.extend_from_slice(escaped);
+        start = i + 1;
+    }
+    out.extend_from_slice(&bytes[start..]);
 }
 
 /// Append `val` to `buf` as exactly `width` ASCII digits, zero-padded. Avoids
@@ -451,6 +510,34 @@ fn write_prefix(buf: &mut Vec<u8>, fmt: &mut TimestampCache, ts: Timestamp, leve
     }
 }
 
+/// Write the JSON envelope up to and including the `level` field, i.e.
+/// `{"time":<ts>,"level":"<lvl>"`. `name`/`msg` (with their leading commas) and
+/// the closing `}` are appended by `emit`.
+#[inline(always)]
+fn write_prefix_json(buf: &mut Vec<u8>, fmt: &mut TimestampCache, ts: Timestamp, level: log::Level, unix_ts: bool) {
+    // A producer thread may have refreshed this second before a JSON writer was
+    // registered; rebuild the JSON prefixes if so.
+    if fmt.time_prefix_json.is_empty() {
+        fmt.refresh(ts.secs);
+    }
+    let level = level_str(level);
+    if unix_ts {
+        // {"time":SECS.nnnnnnnnn,"level":"<lvl>"
+        buf.extend_from_slice(fmt.unix_prefix_json.as_bytes());
+        push_pad(buf, ts.nanos, 9);
+        buf.extend_from_slice(JSON_LEVEL_SEP);
+        buf.extend_from_slice(level.as_bytes());
+        buf.push(b'"');
+    } else {
+        // {"time":"YYYY-MM-DDThh:mm:ss.uuuuuu+HH:MM","level":"<lvl>"
+        buf.extend_from_slice(fmt.time_prefix_json.as_bytes());
+        push_pad(buf, ts.nanos / 1_000, 6);
+        buf.extend_from_slice(fmt.offset_json.as_bytes());
+        buf.extend_from_slice(level.as_bytes());
+        buf.push(b'"');
+    }
+}
+
 /// Render one log line into the calling thread's buffer and, once a full batch
 /// has accumulated, ship the raw bytes to the writer thread. `write_msg` writes
 /// the message body directly into the buffer, avoiding any intermediate copy.
@@ -460,6 +547,7 @@ fn emit<F: FnOnce(&mut Vec<u8>)>(
     batch_size: usize,
     unix_ts: bool,
     color: bool,
+    json: bool,
     name: Option<&str>,
     level: log::Level,
     write_msg: F,
@@ -470,29 +558,43 @@ fn emit<F: FnOnce(&mut Vec<u8>)>(
         let Producer { fmt, buf, count, .. } = &mut *producer;
         fmt.update(ts.secs);
 
-        write_prefix(buf, fmt, ts, level, unix_ts, color);
-        if let Some(name) = name {
+        if json {
+            // NDJSON: {"time":<ts>,"level":"<lvl>"[,"name":"<name>"],"msg":"<msg>"}
+            // `write_msg` escapes the message; color is ignored for JSON.
+            write_prefix_json(buf, fmt, ts, level, unix_ts);
+            if let Some(name) = name {
+                buf.extend_from_slice(b",\"name\":\"");
+                json_escape(buf, name.as_bytes());
+                buf.push(b'"');
+            }
+            buf.extend_from_slice(b",\"msg\":\"");
+            write_msg(buf);
+            buf.extend_from_slice(b"\"}\n");
+        } else {
+            write_prefix(buf, fmt, ts, level, unix_ts, color);
+            if let Some(name) = name {
+                if color {
+                    buf.extend_from_slice(b" ");
+                    buf.extend_from_slice(DIM.as_bytes());
+                    buf.extend_from_slice(b"name=");
+                    buf.extend_from_slice(RESET.as_bytes());
+                } else {
+                    buf.extend_from_slice(b" name=");
+                }
+                buf.extend_from_slice(name.as_bytes());
+            }
             if color {
                 buf.extend_from_slice(b" ");
                 buf.extend_from_slice(DIM.as_bytes());
-                buf.extend_from_slice(b"name=");
+                buf.extend_from_slice(b"msg=");
                 buf.extend_from_slice(RESET.as_bytes());
+                buf.extend_from_slice(b"\"");
             } else {
-                buf.extend_from_slice(b" name=");
+                buf.extend_from_slice(b" msg=\"");
             }
-            buf.extend_from_slice(name.as_bytes());
+            write_msg(buf);
+            buf.extend_from_slice(b"\"\n");
         }
-        if color {
-            buf.extend_from_slice(b" ");
-            buf.extend_from_slice(DIM.as_bytes());
-            buf.extend_from_slice(b"msg=");
-            buf.extend_from_slice(RESET.as_bytes());
-            buf.extend_from_slice(b"\"");
-        } else {
-            buf.extend_from_slice(b" msg=\"");
-        }
-        write_msg(buf);
-        buf.extend_from_slice(b"\"\n");
 
         *count += 1;
         if *count >= batch_size {
@@ -590,8 +692,8 @@ pub fn init<P: ToString + Send + 'static>(name: &str, path: Option<P>, level: Le
 #[cfg(feature = "python")]
 mod python {
     use super::{
-        emit, flush_producer, worker, Action, Context, LevelFilter, CHANNEL_CAPACITY,
-        COLOR_LIVE, DEFAULT_BATCH_SIZE, PRODUCER,
+        emit, flush_producer, json_escape, worker, Action, Context, LevelFilter,
+        CHANNEL_CAPACITY, COLOR_LIVE, DEFAULT_BATCH_SIZE, JSON_LIVE, PRODUCER,
     };
     use chrono::Local;
     use crossbeam_channel::Sender;
@@ -618,6 +720,19 @@ mod python {
             "off" => ColorMode::Off,
             "always" => ColorMode::Always,
             _ => ColorMode::Auto,
+        }
+    }
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum LogFormat {
+        Logfmt,
+        Json,
+    }
+
+    fn parse_format(fmt: &str) -> LogFormat {
+        match fmt {
+            "json" => LogFormat::Json,
+            _ => LogFormat::Logfmt,
         }
     }
 
@@ -676,11 +791,12 @@ mod python {
         tx: Sender<Action>,
         unix_ts: bool,
         color: bool,
+        json: bool,
         thread: Mutex<Option<JoinHandle<()>>>,
     }
 
     impl SharedWriter {
-        fn new(path: Option<String>, unix_ts: bool, color: bool) -> Self {
+        fn new(path: Option<String>, unix_ts: bool, color: bool, json: bool) -> Self {
             let (tx, rx) = crossbeam_channel::bounded(CHANNEL_CAPACITY);
             let ctx = Context {
                 rx,
@@ -697,6 +813,7 @@ mod python {
                 tx,
                 unix_ts,
                 color,
+                json,
                 thread: Mutex::new(Some(thread)),
             }
         }
@@ -736,6 +853,11 @@ mod python {
         &DEFAULT_COLOR
     }
 
+    fn default_format_cell() -> &'static OnceLock<Mutex<LogFormat>> {
+        static DEFAULT_FORMAT: OnceLock<Mutex<LogFormat>> = OnceLock::new();
+        &DEFAULT_FORMAT
+    }
+
     fn default_path() -> Option<String> {
         default_path_cell()
             .get_or_init(|| Mutex::new(None))
@@ -754,6 +876,13 @@ mod python {
     fn default_color() -> ColorMode {
         *default_color_cell()
             .get_or_init(|| Mutex::new(ColorMode::Auto))
+            .lock()
+            .unwrap()
+    }
+
+    fn default_format() -> LogFormat {
+        *default_format_cell()
+            .get_or_init(|| Mutex::new(LogFormat::Logfmt))
             .lock()
             .unwrap()
     }
@@ -779,6 +908,15 @@ mod python {
         *cell.lock().unwrap() = mode;
     }
 
+    fn set_default_format(fmt: LogFormat) {
+        // Flip the global gate so producer threads start building JSON prefixes.
+        if fmt == LogFormat::Json {
+            JSON_LIVE.store(true, Ordering::Relaxed);
+        }
+        let cell = default_format_cell().get_or_init(|| Mutex::new(LogFormat::Logfmt));
+        *cell.lock().unwrap() = fmt;
+    }
+
     fn shared_writer(path: Option<String>) -> Arc<SharedWriter> {
         let key = match path.clone() {
             Some(p) => PathKey::File(p),
@@ -793,7 +931,8 @@ mod python {
         }
 
         let color = resolve_color(default_color(), &path);
-        let writer = Arc::new(SharedWriter::new(path, default_unix_ts(), color));
+        let json = matches!(default_format(), LogFormat::Json);
+        let writer = Arc::new(SharedWriter::new(path, default_unix_ts(), color, json));
         map.insert(key, Arc::downgrade(&writer));
         writer
     }
@@ -1118,6 +1257,7 @@ mod python {
             }
             let batch_size = BATCH_SIZE.load(Ordering::Relaxed);
 
+            let json = self.writer.json;
             if args.is_empty() {
                 // Verbatim, no % processing — matches stdlib logging.
                 let msg = message.to_str()?;
@@ -1126,9 +1266,16 @@ mod python {
                     batch_size,
                     self.writer.unix_ts,
                     self.writer.color,
+                    json,
                     self.name.as_deref(),
                     level,
-                    |buf| buf.extend_from_slice(msg.as_bytes()),
+                    |buf| {
+                        if json {
+                            json_escape(buf, msg.as_bytes());
+                        } else {
+                            buf.extend_from_slice(msg.as_bytes());
+                        }
+                    },
                 );
                 return Ok(());
             }
@@ -1146,9 +1293,16 @@ mod python {
                     batch_size,
                     self.writer.unix_ts,
                     self.writer.color,
+                    json,
                     self.name.as_deref(),
                     level,
-                    |buf| buf.extend_from_slice(&scratch),
+                    |buf| {
+                        if json {
+                            json_escape(buf, &scratch);
+                        } else {
+                            buf.extend_from_slice(&scratch);
+                        }
+                    },
                 );
             }
             scratch.clear();
@@ -1161,16 +1315,18 @@ mod python {
     #[pyo3(name = "_logger")]
     pub fn logger_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
         #[pyfunction]
-        #[pyo3(signature = (path=None, unix_ts=false, batch_size=None, color="auto".to_string()))]
+        #[pyo3(signature = (path=None, unix_ts=false, batch_size=None, color="auto".to_string(), format="logfmt".to_string()))]
         fn basic_config(
             path: Option<String>,
             unix_ts: bool,
             batch_size: Option<usize>,
             color: String,
+            format: String,
         ) -> PyResult<()> {
             set_default_path(path);
             set_default_unix_ts(unix_ts);
             set_default_color(parse_color(&color));
+            set_default_format(parse_format(&format));
             if let Some(size) = batch_size {
                 BATCH_SIZE.store(size.max(1), Ordering::Relaxed);
             }

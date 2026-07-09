@@ -50,6 +50,7 @@ def basicConfig(
     unix_ts: bool = False,
     batch_size: int | None = None,
     color: str = "auto",
+    format: str = "logfmt",
 ) -> None:
     """Configure the root logger.
 
@@ -67,13 +68,22 @@ def basicConfig(
                and pipes stay plain.
                "off" — never emit ANSI color.
                "always" — always emit ANSI color, even to files and pipes.
+        format: Output line format. One of:
+               "logfmt" (default) — `time=... level=... [name=...] msg="..."`.
+               "json" — one JSON object per line (NDJSON) with fields
+               {time, level, name, msg}, properly escaped. `time` is a string,
+               or a number when unix_ts=True. `name` is omitted when unset.
+               JSON output ignores `color` (it is never colorized). This is the
+               recommended format for shipping logs to Vector/Fluentd → a DB.
     """
     if color not in ("auto", "off", "always"):
         raise ValueError(
             f"color must be 'auto', 'off', or 'always', got {color!r}"
         )
+    if format not in ("logfmt", "json"):
+        raise ValueError(f"format must be 'logfmt' or 'json', got {format!r}")
     global _DEFAULT_LEVEL, _NAME_LEVELS, _root_logger
-    _basic_config(filename, unix_ts, batch_size, color)
+    _basic_config(filename, unix_ts, batch_size, color, format)
     _DEFAULT_LEVEL = level
     _NAME_LEVELS = {} if name_levels is None else dict(name_levels)
     # Create root logger

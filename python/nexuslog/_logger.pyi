@@ -24,5 +24,6 @@ def basic_config(
     unix_ts: bool = False,
     batch_size: int | None = None,
     color: str = "auto",
+    format: str = "logfmt",
 ) -> None: ...
 def get_logger(name: str | None, level: PyLevel = PyLevel.Info) -> PyLogger: ...

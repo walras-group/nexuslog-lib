@@ -71,7 +71,7 @@ logging.ERROR
 ### 模块级函数
 
 ```python
-logging.basicConfig(filename=None, level=logging.INFO, unix_ts=False, color="auto")
+logging.basicConfig(filename=None, level=logging.INFO, unix_ts=False, color="auto", format="logfmt")
 logging.basicConfig(
     level=logging.INFO,
     name_levels={"db": logging.DEBUG, "http.client": logging.WARNING},
@@ -114,6 +114,29 @@ logging.basicConfig(color="auto")  # 默认
 
 配色：`error` 红、`warn` 黄、`info` 绿、`debug` 青、`trace` 暗淡。
 消息正文永不着色。颜色未启用时，热路径上没有任何额外开销。
+
+### JSON 输出
+
+```python
+logging.basicConfig(filename="app.log", format="json")
+```
+
+`format` 选择每行的布局：
+
+- `"logfmt"`（默认）——`time=... level=... [name=...] msg="..."`。
+- `"json"`——每行一个 JSON 对象（NDJSON）：
+
+  ```json
+  {"time":"2026-07-09T09:45:59.914644+08:00","level":"warn","name":"svc","msg":"disk 90% full"}
+  ```
+
+  字段为 `{time, level, name, msg}`，消息经过正确的 JSON 转义。`time` 是
+  ISO-8601 字符串，`unix_ts=True` 时为数字。`name` 未设置时省略。JSON 输出
+  忽略 `color`（永不着色）。
+
+NDJSON 是把日志投递到数据库的推荐格式：先写文件，再由转发器(Vector /
+Fluent Bit / Fluentd / Logstash)tail 该文件并写入 ClickHouse / PostgreSQL 等
+——JSON 几乎零配置即可解析。
 
 ### Logger 类
 

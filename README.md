@@ -71,7 +71,7 @@ logging.ERROR
 ### Module-level Functions
 
 ```python
-logging.basicConfig(filename=None, level=logging.INFO, unix_ts=False, color="auto")
+logging.basicConfig(filename=None, level=logging.INFO, unix_ts=False, color="auto", format="logfmt")
 logging.basicConfig(
     level=logging.INFO,
     name_levels={"db": logging.DEBUG, "http.client": logging.WARNING},
@@ -120,6 +120,31 @@ severity) and the logfmt keys (dimmed):
 Colors: `error` red, `warn` yellow, `info` green, `debug` cyan, `trace` dim.
 The message body is never colored. There is no cost on the hot path when
 color is inactive.
+
+### JSON Output
+
+```python
+logging.basicConfig(filename="app.log", format="json")
+```
+
+`format` selects the line layout:
+
+- `"logfmt"` (default) — `time=... level=... [name=...] msg="..."`.
+- `"json"` — one JSON object per line (NDJSON):
+
+  ```json
+  {"time":"2026-07-09T09:45:59.914644+08:00","level":"warn","name":"svc","msg":"disk 90% full"}
+  ```
+
+  Fields are `{time, level, name, msg}`, with proper JSON escaping of the
+  message. `time` is an ISO-8601 string, or a number when `unix_ts=True`.
+  `name` is omitted when unset. JSON output ignores `color` (it is never
+  colorized).
+
+NDJSON is the recommended format for shipping logs to a database: write to a
+file, then let a forwarder (Vector, Fluent Bit, Fluentd, Logstash) tail it and
+insert into ClickHouse / PostgreSQL / etc. — the JSON parses with near-zero
+configuration.
 
 ### Logger Class
 

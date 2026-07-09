@@ -88,3 +88,75 @@ def test_color_invalid_value_raises() -> None:
 
     with pytest.raises(ValueError):
         logging.basicConfig(color="rainbow")
+
+
+def _read_json_lines(path: str) -> list:
+    import json
+
+    return [
+        json.loads(line)
+        for line in _read_file(path).splitlines()
+        if line.strip()
+    ]
+
+
+def test_json_format_emits_valid_ndjson(tmp_path) -> None:
+    path = tmp_path / "nexuslog_json.log"
+    logging.basicConfig(filename=str(path), format="json", batch_size=1)
+    logging.getLogger("svc").warning("disk %d%% full", 90)
+    logging.getLogger("svc").shutdown()
+
+    objs = _read_json_lines(str(path))
+    assert len(objs) == 1
+    obj = objs[0]
+    assert obj["level"] == "warn"
+    assert obj["name"] == "svc"
+    assert obj["msg"] == "disk 90% full"
+    # `time` is an ISO-8601 string parseable by datetime.
+    import datetime
+
+    datetime.datetime.fromisoformat(obj["time"])
+
+
+def test_json_format_escapes_special_chars(tmp_path) -> None:
+    path = tmp_path / "nexuslog_json_esc.log"
+    logging.basicConfig(filename=str(path), format="json", batch_size=1)
+    msg = 'quote " backslash \\ newline \n tab \t end'
+    logging.getLogger("esc").error(msg)
+    logging.getLogger("esc").shutdown()
+
+    objs = _read_json_lines(str(path))
+    assert len(objs) == 1
+    # Round-trips back to the exact original message.
+    assert objs[0]["msg"] == msg
+
+
+def test_json_format_unix_ts_is_numeric(tmp_path) -> None:
+    path = tmp_path / "nexuslog_json_unix.log"
+    logging.basicConfig(filename=str(path), format="json", unix_ts=True, batch_size=1)
+    logging.getLogger("u").info("hi")
+    logging.getLogger("u").shutdown()
+
+    objs = _read_json_lines(str(path))
+    assert len(objs) == 1
+    assert isinstance(objs[0]["time"], (int, float))
+
+
+def test_json_format_omits_name_when_none(tmp_path) -> None:
+    path = tmp_path / "nexuslog_json_noname.log"
+    logging.basicConfig(filename=str(path), format="json", batch_size=1)
+    root = logging.getLogger(None)
+    root.info("no-name")
+    root.shutdown()
+
+    objs = _read_json_lines(str(path))
+    assert len(objs) == 1
+    assert "name" not in objs[0]
+    assert objs[0]["msg"] == "no-name"
+
+
+def test_format_invalid_value_raises() -> None:
+    import pytest
+
+    with pytest.raises(ValueError):
+        logging.basicConfig(format="xml")
